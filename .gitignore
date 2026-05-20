@@ -1,0 +1,5 @@
+.zsh_secrets
+.zsh_osm
+.env
+.env.*
+.DS_Store
