@@ -15,6 +15,7 @@ alias config="cd ~/.config"
 alias sz="source ~/.zshrc"
 
 export PATH="$HOME/.local/bin:$PATH"
+export EDITOR='nvim'
 
 stringify() {
   if [ -t 0 ]; then
@@ -49,4 +50,49 @@ unstringify() {
 dotfiles() {
   cd ~/dotfiles || return
   nvim .
+} 
+jwt() {
+  local token header payload signature
+
+  if [ -t 0 ]; then
+    token="$1"
+  else
+    token="$(cat)"
+  fi
+
+  IFS='.' read -r header payload signature <<< "$token"
+
+  if [ -z "$header" ] || [ -z "$payload" ]; then
+    echo "Invalid JWT format" >&2
+    return 1
+  fi
+
+  decode_base64url() {
+    local input="$1"
+    input="${input//-/+}"
+    input="${input//_//}"
+
+    case $((${#input} % 4)) in
+      2) input="${input}==" ;;
+      3) input="${input}=" ;;
+      1) echo "Invalid base64 string" >&2; return 1 ;;
+    esac
+
+    printf '%s' "$input" | base64 --decode 2>/dev/null
+  }
+
+  echo "Header:"
+  decode_base64url "$header" | jq .
+
+  echo
+  echo "Payload:"
+  decode_base64url "$payload" | jq .
+}
+
+formatter() {
+  if [ -t 0 ]; then
+    printf '%s\n' "$1" | jq .
+  else
+    jq .
+  fi
 }
