@@ -96,3 +96,23 @@ formatter() {
     jq .
   fi
 }
+
+# ── AWS profile switcher: `awsp <profile>` ───────────────
+awsp() {
+  if [ -z "$1" ]; then
+    echo "current: ${AWS_PROFILE:-(none)}"
+    echo "usage: awsp <profile>"
+    echo "profiles:"
+    aws configure list-profiles | sed 's/^/  /'
+    return 0
+  fi
+  export AWS_PROFILE="$1"
+  # Refresh SSO login if the cached token is missing/expired
+  if ! aws sts get-caller-identity >/dev/null 2>&1; then
+    aws sso login --profile "$1" || return 1
+  fi
+  aws sts get-caller-identity --output json
+}
+
+# Tab-completion: complete `awsp` with your configured profiles
+compdef '_values profile $(aws configure list-profiles)' awsp 2>/dev/null
