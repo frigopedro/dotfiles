@@ -116,3 +116,4 @@ awsp() {
 
 # Tab-completion: complete `awsp` with your configured profiles
 compdef '_values profile $(aws configure list-profiles)' awsp 2>/dev/null
+eval "$(zoxide init zsh)"
