@@ -2,7 +2,6 @@
 # Q post block. Keep at the bottom of this file.
 [ -f "$HOME/dotfiles/.zsh_secrets" ] && source "$HOME/dotfiles/.zsh_secrets"
 [ -f "$HOME/dotfiles/.zsh_osm" ] && source "$HOME/dotfiles/.zsh_osm"
-
 alias proj="cd ~/Desktop/Projects"
 alias gs="git status"
 alias gc="git commit -m"
