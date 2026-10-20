@@ -220,15 +220,26 @@ enrich() {
   done
 }
 
-# group_info <cwd> → G_KEY (repo root, or the dir itself outside a repo),
-# G_LABEL (repo name or ~-shortened dir), G_DETAIL ("branch[/subdir]" in a repo)
+# group_info <cwd> → G_KEY (main repo root, or the dir itself outside a repo;
+# a linked worktree resolves to the repo it belongs to), G_WT (the checkout
+# the cwd is in: the worktree root, or G_KEY for the main checkout), G_LABEL
+# (repo name or ~-shortened dir), G_BRANCH, G_SUB ("/subdir" inside the
+# checkout) and G_DETAIL ("branch[/subdir]" in a repo)
 group_info() {
-  local cwd=$1
+  local cwd=$1 root gd
   if repo_root "$cwd"; then
-    G_KEY=$REPLY G_LABEL=${REPLY:t}
-    git_branch "$G_KEY"; G_DETAIL="${REPLY}${cwd#$G_KEY}"
+    root=$REPLY G_WT=$REPLY
+    # A linked worktree's .git file points at <main>/.git/worktrees/<name>.
+    if [[ -f $root/.git ]]; then
+      gd=$(<"$root/.git"); gd=${gd#gitdir: }
+      [[ $gd != /* ]] && gd=$root/$gd
+      [[ $gd == */.git/worktrees/* ]] && root=${gd%%/.git/worktrees/*}
+    fi
+    G_KEY=$root G_LABEL=${root:t}
+    git_branch "$G_WT"; G_BRANCH=$REPLY G_SUB=${cwd#$G_WT}
+    G_DETAIL="${G_BRANCH}${G_SUB}"
   else
-    G_KEY=$cwd G_LABEL=${cwd/#$HOME/\~} G_DETAIL=""
+    G_KEY=$cwd G_WT=$cwd G_LABEL=${cwd/#$HOME/\~} G_BRANCH="" G_SUB="" G_DETAIL=""
   fi
 }
 
@@ -257,8 +268,10 @@ status_color() {
 # collect: after scan + enrich, the interactive sessions in display order in
 # SORTED (pids): groups by their most urgent session, then sessions within a
 # group by urgency and recency. Fills A_GROUP / A_DETAIL per pid, G_LABELS and
-# G_COUNT ("<group>:<status>" → n) per group.
-typeset -gA A_GROUP A_DETAIL G_LABELS G_BEST G_COUNT
+# G_COUNT ("<group or worktree>:<status>" → n). Sessions in a repo's linked
+# worktrees nest under it: A_WT / W_LABELS / W_BEST per worktree, and
+# G_NESTED[group] is set for repos that have any session in a linked worktree.
+typeset -gA A_GROUP A_DETAIL A_SUB A_WT G_LABELS G_BEST G_COUNT W_LABELS W_BEST G_NESTED
 typeset -ga SORTED
 collect() {
   local pid key
@@ -267,15 +280,19 @@ collect() {
   for pid in $CLAUDE_PIDS; do
     [[ -n ${CL_KIND[$pid]} && ${CL_KIND[$pid]} != interactive ]] && continue
     group_info "${CL_CWD[$pid]}"
-    A_GROUP[$pid]=$G_KEY A_DETAIL[$pid]=$G_DETAIL G_LABELS[$G_KEY]=$G_LABEL
+    A_GROUP[$pid]=$G_KEY A_WT[$pid]=$G_WT A_DETAIL[$pid]=$G_DETAIL A_SUB[$pid]=$G_SUB
+    G_LABELS[$G_KEY]=$G_LABEL W_LABELS[$G_WT]=${G_BRANCH:-${G_WT:t}}
+    [[ $G_WT != $G_KEY ]] && G_NESTED[$G_KEY]=1
     (( G_COUNT[$G_KEY:${CL_STATUS[$pid]}]++ ))
+    (( G_COUNT[wt:$G_WT:${CL_STATUS[$pid]}]++ ))
     status_rank ${CL_STATUS[$pid]}
     key="${REPLY}$(( 9999999999 - ${CL_TS[$pid]:-0} ))"
     akey[$pid]=$key
     [[ -z ${G_BEST[$G_KEY]} || $key < ${G_BEST[$G_KEY]} ]] && G_BEST[$G_KEY]=$key
+    [[ -z ${W_BEST[$G_WT]} || $key < ${W_BEST[$G_WT]} ]] && W_BEST[$G_WT]=$key
   done
   for pid in ${(k)akey}; do
-    keyed+=("${G_BEST[${A_GROUP[$pid]}]}${US}${A_GROUP[$pid]}${US}${akey[$pid]}${US}${pid}")
+    keyed+=("${G_BEST[${A_GROUP[$pid]}]}${US}${A_GROUP[$pid]}${US}${W_BEST[${A_WT[$pid]}]}${US}${A_WT[$pid]}${US}${akey[$pid]}${US}${pid}")
   done
   SORTED=(${${(o)keyed}##*$US})
 }
@@ -295,8 +312,15 @@ group_counts() {
 
 # ── list ────────────────────────────────────────────────
 # A tree: one row per repo (bold, with status counts), its sessions under it.
+# A repo with sessions in linked worktrees gets a row per worktree between the
+# two, and its sessions hang off those.
 cmd_list() {
-  local origin=$1 pid pane grp prev="" st name detail age mark conn glyph i
+  local origin=$1 pid pane grp wt prev="" prevwt="" st name detail age mark conn glyph i
+  local nested wconn vline pad nw=28 next
+  # Width of the picker's list pane (set by cmd_pick); spare room goes to the
+  # session name so rows fill the pane.
+  local extra=$(( ${CLAUDE_SESSIONS_WIDTH:-0} - 54 ))
+  (( extra < 0 )) && extra=0
   scan_all; enrich; collect
   publish_tmux   # keep the status bar in step with what the picker shows
 
@@ -308,22 +332,39 @@ cmd_list() {
       truncate_to 30 "${G_LABELS[$grp]}"; name=$REPLY
       group_counts $grp
       print -r -- " ${C_MAGENTA}${C_BOLD}${(r:30:)name}${C_RESET}  ${REPLY}"$'\t'repo$'\t'$pane$'\t'$pid$'\t'$grp
-      prev=$grp
+      prev=$grp prevwt=""
     fi
 
-    if (( i == $#SORTED )) || [[ ${A_GROUP[$SORTED[i+1]]} != $grp ]]; then conn="└"; else conn="├"; fi
+    wt=${A_WT[$pid]} nested=${G_NESTED[$grp]} pad="" vline="" nw=$(( 28 + extra ))
+    next=$SORTED[i+1]
+    if [[ -n $nested ]]; then
+      # Does this worktree have a following sibling in the repo?
+      local j=$i
+      while (( ++j <= $#SORTED )) && [[ ${A_GROUP[$SORTED[j]]} == $grp && ${A_WT[$SORTED[j]]} == $wt ]]; do :; done
+      if (( j <= $#SORTED )) && [[ ${A_GROUP[$SORTED[j]]} == $grp ]]; then wconn="├" vline="│"; else wconn="└" vline=" "; fi
+      if [[ $wt != $prevwt ]]; then
+        truncate_to 27 "${W_LABELS[$wt]}"; name=$REPLY
+        group_counts "wt:$wt"
+        print -r -- " ${C_DIM}${wconn}${C_RESET} ${C_BLUE}${C_BOLD}${(r:27:)name}${C_RESET}  ${REPLY}"$'\t'worktree$'\t'$pane$'\t'$pid$'\t'$grp
+        prevwt=$wt
+      fi
+      pad="${C_DIM}${vline}${C_RESET} " nw=$(( 25 + extra ))
+    fi
+
+    if (( i == $#SORTED )) || [[ ${A_GROUP[$next]} != $grp || ${A_WT[$next]} != $wt ]]; then conn="└"; else conn="├"; fi
     mark=" "; [[ $pane == $origin ]] && mark="${C_CYAN}▸${C_RESET}"
     st=${CL_STATUS[$pid]}
     status_glyph $st; glyph=$REPLY
-    truncate_to 28 "${CL_NAME[$pid]}"; name=${(r:28:)REPLY}
+    truncate_to $nw "${CL_NAME[$pid]}"; name=${(r:$nw:)REPLY}
     # Sessions that need you get a colored name too, not just the glyph.
     case $st in waiting|review) status_color $st; name="${REPLY}${name}${C_RESET}" ;; esac
-    truncate_to 16 "${A_DETAIL[$pid]}"; detail=$REPLY
+    if [[ -n $nested ]]; then detail=${A_SUB[$pid]#/}; else detail=${A_DETAIL[$pid]}; fi
+    truncate_to 16 "$detail"; detail=$REPLY
     format_age ${CL_TS[$pid]}; age=$REPLY
     [[ $age == - ]] && age=""
     [[ $age == *s ]] && age="<1m"   # keep rows stable between refreshes
 
-    print -r -- "${mark}${C_DIM}${conn}${C_RESET} ${glyph} ${name} ${C_DIM}${(r:16:)detail} ${(l:3:)age}${C_RESET}"$'\t'agent$'\t'$pane$'\t'$pid$'\t'$grp
+    print -r -- "${mark}${pad}${C_DIM}${conn}${C_RESET} ${glyph} ${name} ${C_DIM}${(r:16:)detail} ${(l:3:)age}${C_RESET}"$'\t'agent$'\t'$pane$'\t'$pid$'\t'$grp
   done
 }
 
@@ -477,7 +518,7 @@ preview_repo() {
 # option changes.
 FLAG_waiting='#[bg=red,fg=white,bold] ⚠ #[default]'
 FLAG_review='#[bg=blue,fg=white,bold] ✓ #[default]'
-FLAG_working='#[fg=black]●#[default]'
+FLAG_working='#[fg=#0d1117]●#[default]'
 publish_tmux() {
   local pid st w line flag
   local -a f cmd
@@ -502,7 +543,7 @@ publish_tmux() {
   local summary=""
   (( nw )) && summary+="#[bg=red,fg=white,bold] ⚠ $nw waiting #[default] "
   (( nr )) && summary+="#[bg=blue,fg=white,bold] ✓ $nr review #[default] "
-  (( nk )) && summary+="#[fg=black]● $nk working#[default] "
+  (( nk )) && summary+="#[fg=#0d1117]● $nk working#[default] "
   cmd=(set -g @claude_status "$summary")
 
   for w in ${(k)cur_flag}; do
@@ -591,6 +632,11 @@ cmd_pick() {
   # Inside a popup, the client's active pane is the one we were opened from.
   local origin=${1:-$(tmux display-message -p '#{pane_id}' 2>/dev/null)}
   command -v fzf >/dev/null || { print "fzf not found"; sleep 2; return 1 }
+
+  # List pane = 40% of the popup, less pointer, border and scrollbar.
+  local cols=${COLUMNS:-0}
+  (( cols > 0 )) || cols=$(stty size 2>/dev/null </dev/tty | awk '{print $2}')
+  export CLAUDE_SESSIONS_WIDTH=$(( ${cols:-0} * 40 / 100 - 4 ))
 
   local sock="${TMPDIR:-/tmp}/claude-sessions-$$.sock"
   local tmp="${TMPDIR:-/tmp}/claude-sessions-$$.list"
