@@ -14,7 +14,8 @@
 # Worktree level: the main checkout first, then its worktrees, local branches
 # and origin/* branches (fetched in the background). Typing filters; enter
 # opens a worktree, creates one for a local/remote branch, or "+ Create new
-# branch <query>" off the main checkout's current branch. The right panel
+# branch <query>" off the base (ctrl-b to change; defaults to the main
+# checkout's current branch). The right panel
 # previews the highlighted row (ctrl-/ toggles it). ctrl-x deletes a
 # worktree, ctrl-r refetches, esc goes back. Worktrees live in
 # <repo>/.worktrees/<slug> and open as their own session, "<repo>/<slug>".
@@ -30,7 +31,6 @@
 #        tmux-project-switcher.sh wt-delete <repo> <state> <row>
 #        tmux-project-switcher.sh preview <repo> <state> <row>
 
-PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Desktop/Projects}"
 HISTORY_FILE="$HOME/.cache/tmux-project-switcher/history.tsv"
 mkdir -p "$(dirname "$HISTORY_FILE")"
 
@@ -39,6 +39,7 @@ SELF=${0:A}
 
 source "${0:A:h}/lib/tmux-common.zsh"
 source "${0:A:h}/lib/git-worktree.zsh"
+source "${0:A:h}/lib/tmux-settings.zsh"
 
 # session_for <dir> → REPLY = the tmux session name used for that project
 session_for() { REPLY="${${1:t}//[. ]/_}" }
@@ -88,22 +89,28 @@ touch_history() {
   print -rl -- "${keep[@]}" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
 }
 
-# open_session <dir> <session> → creates the dev/term layout unless the
-# session already exists, then switches the client to it.
+# open_session <dir> <session> → creates the session's windows (editor + side
+# pane, then a tiled term window; all configurable in the settings panel)
+# unless it already exists, then switches the client to it.
 open_session() {
-  local dir=$1 s=$2
+  local dir=$1 s=$2 dev term editor side panes i
   if ! tmux has-session -t "=$s" 2>/dev/null; then
-    tmux new-session -d -s "$s" -c "$dir" -n dev
-    tmux send-keys -t "=${s}:dev.0" 'nvim .' C-m
-    tmux split-window -h -p 35 -t "=${s}:dev" -c "$dir"
-    tmux select-pane -t "=${s}:dev.0"
-    tmux new-window -t "=${s}:" -n term -c "$dir"
-    tmux split-window -t "=${s}:term" -c "$dir"
-    tmux split-window -t "=${s}:term" -c "$dir"
-    tmux split-window -t "=${s}:term" -c "$dir"
-    tmux select-layout -t "=${s}:term" tiled
-    tmux select-pane -t "=${s}:term.0"
-    tmux select-window -t "=${s}:dev"
+    settings_get win-dev; dev=$REPLY
+    settings_get win-term; term=$REPLY
+    settings_get editor-cmd; editor=$REPLY
+    settings_get side-pct; side=$REPLY
+    settings_get term-panes; panes=$REPLY
+    tmux new-session -d -s "$s" -c "$dir" -n "$dev"
+    [[ $editor != none ]] && tmux send-keys -t "=${s}:${dev}.0" "$editor" C-m
+    (( side > 0 )) && tmux split-window -h -p "$side" -t "=${s}:${dev}" -c "$dir"
+    tmux select-pane -t "=${s}:${dev}.0"
+    if (( panes > 0 )); then
+      tmux new-window -t "=${s}:" -n "$term" -c "$dir"
+      for (( i = 2; i <= panes; i++ )); do tmux split-window -t "=${s}:${term}" -c "$dir"; done
+      tmux select-layout -t "=${s}:${term}" tiled
+      tmux select-pane -t "=${s}:${term}.0"
+    fi
+    tmux select-window -t "=${s}:${dev}"
   fi
   tmux switch-client -t "=$s"
 }
@@ -268,19 +275,22 @@ print_header() {
     noorigin)    s="no origin remote — local branches only" ;;
   esac
   print -r -- "${1:t} · default: ${base:-⚠ detached HEAD} · $s"
-  print -r -- "enter: open/create · ctrl-x: delete · ctrl-r: fetch · ctrl-/: preview · esc: back"
+  print -r -- "enter: open/create · ctrl-x: delete · ctrl-b: base · ctrl-r: fetch · ctrl-/: preview · esc: back"
 }
 
 # preview_row <repo> <state> <row> → the right-hand panel: what the row is,
 # how it compares to its upstream (checkouts) or to the default branch
 # (branches), uncommitted changes, and recent commits.
 preview_row() {
-  local repo=$1 state=$2 type data dir ref b base
+  local repo=$1 state=$2 type data dir ref b base baseref
   local B=$'\e[1m' D=$'\e[2m' Y=$'\e[33m' G=$'\e[32m' Rd=$'\e[31m' N=$'\e[0m'
   local -a f=("${(@ps:\t:)3}") counts
   type=${f[3]} data=${f[4]}
   base=$(<"$state/base")
   dir=$repo ref=HEAD
+  # The base is a local branch, or origin/<branch> when picked from the remote.
+  baseref=refs/heads/$base
+  [[ -n $base ]] && ! git -C "$repo" show-ref -q --verify "$baseref" && baseref=refs/remotes/$base
 
   case $type in
     main|wt)
@@ -303,7 +313,7 @@ preview_row() {
       print -r -- "${D}enter$N    creates ${REPLY#"$repo/"}"
       [[ $type == remote ]] && print -r -- "${D}tracks$N   origin/$data"
       if [[ -n $base && $base != $data ]]; then
-        counts=(${=$(git -C "$repo" rev-list --left-right --count "$ref...refs/heads/$base" 2>/dev/null)})
+        counts=(${=$(git -C "$repo" rev-list --left-right --count "$ref...$baseref" 2>/dev/null)})
         (( $#counts )) && print -r -- "${D}vs $base$N  ↑${counts[1]} ↓${counts[2]}"
       fi
       ;;
@@ -315,8 +325,8 @@ preview_row() {
       wt_path_for "$repo" "$data"
       print -r -- "${D}enter$N    creates ${REPLY#"$repo/"}"
       if [[ -n $base ]]; then
-        print -r -- "${D}from$N     $base ${D}(local, the main checkout's branch)$N"
-        ref=refs/heads/$base
+        print -r -- "${D}from$N     $base"
+        ref=$baseref
       else
         print -r -- "$Y⚠ main checkout is detached; you'll pick the base after enter$N"
       fi
@@ -423,8 +433,8 @@ pick_repos_dir() {
   local name=$1 d p ts sel note
   local -a dirs rows
   load_history
-  dirs=(${(f)"$(find "$PROJECTS_DIR" -maxdepth 2 -type d -name Repos 2>/dev/null | sort)"})
-  (( $#dirs )) || { fail "No Repos folders under $PROJECTS_DIR."; return 1 }
+  dirs=(${(f)"$(find "$PROJECTS_DIR" -maxdepth 2 -type d -name "${S[repos-name]}" 2>/dev/null | sort)"})
+  (( $#dirs )) || { fail "No ${S[repos-name]} folders under $PROJECTS_DIR."; return 1 }
   for d in $dirs; do
     ts=0
     for p in ${(k)last_used}; do
@@ -485,18 +495,40 @@ fetch_in_background() {
   } &>/dev/null &!
 }
 
-# pick_base <repo> → REPLY = the start point for a new branch when the main
-# checkout is detached.
-pick_base() {
-  local repo=$1 head sel
+# base_rows <repo> → the base picker's rows: label \t ref
+base_rows() {
+  local repo=$1 head
   head=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null)
+  print -r -- "HEAD ($head, detached)"$'\t'HEAD
+  git -C "$repo" for-each-ref --format=$'%(refname:short)\t%(refname:short)' refs/heads refs/remotes/origin \
+    | grep -v $'^origin\t'
+}
+
+# base_fetch <repo> → background: fetches origin, then tells the base picker
+# (via its --listen port) to reload its rows and show the outcome in the prompt.
+base_fetch() {
+  local repo=$1 mark
+  {
+    wt_fetch "$repo"
+    case $REPLY in
+      ok)          mark="✓ fetched" ;;
+      noorigin)    mark="no origin" ;;
+      *)           mark="⚠ origin unreachable" ;;
+    esac
+    [[ -n $FZF_PORT ]] && curl -fsS -XPOST "localhost:$FZF_PORT" \
+      -d "change-prompt(base $mark> )+reload(${(q)SELF} base-rows ${(q)repo})"
+  } &>/dev/null &!
+}
+
+# pick_base <repo> [header] → REPLY = the start point for a new branch (a
+# local branch, or origin/<branch> for the remote's latest). ctrl-r fetches
+# origin without leaving the picker.
+pick_base() {
+  local repo=$1 sel hdr=${2:-$'⚠ The main checkout is in detached HEAD.\nPick the base for the new branch (esc: cancel)'}
   sel=$(
-    {
-      print -r -- "HEAD ($head, detached)"$'\t'HEAD
-      git -C "$repo" for-each-ref --format=$'%(refname:short)\t%(refname:short)' refs/heads refs/remotes/origin \
-        | grep -v $'^origin\t'
-    } | fzf --reverse --delimiter=$'\t' --with-nth=1 \
-          --header=$'⚠ The main checkout is in detached HEAD.\nPick the base for the new branch (esc: cancel)'
+    base_rows "$repo" | fzf --listen --reverse --delimiter=$'\t' --with-nth=1 --prompt='base> ' \
+          --header="$hdr"$'\nctrl-r: fetch latest from origin' \
+          --bind="ctrl-r:change-prompt(base ⟳ fetching…> )+execute-silent(${(q)SELF} base-fetch ${(q)repo})"
   ) || return 1
   REPLY=${sel##*$'\t'}
 }
@@ -522,7 +554,7 @@ add_worktree() {
 # the query. Falls back to the existing local/remote branch if one appeared
 # since the rows were built.
 create_branch() {
-  local repo=$1 name=$2 base
+  local repo=$1 name=$2 state=$3 base
   git -C "$repo" check-ref-format --branch "$name" &>/dev/null \
     || { fail "'$name' isn't a valid branch name."; return 1 }
   if git -C "$repo" show-ref -q --verify "refs/heads/$name"; then
@@ -530,7 +562,7 @@ create_branch() {
   elif git -C "$repo" show-ref -q --verify "refs/remotes/origin/$name"; then
     add_worktree "$repo" "$name" remote
   else
-    base=$(git -C "$repo" symbolic-ref -q --short HEAD)
+    base=$(<"$state/base")
     if [[ -z $base ]]; then pick_base "$repo" || return 1; base=$REPLY; fi
     add_worktree "$repo" "$name" new "$base"
   fi
@@ -594,7 +626,8 @@ worktree_menu() {
             --bind="ctrl-r:execute-silent($self fetch $r $s)+$refresh" \
             --preview="$self preview $r $s {}" --preview-window=right,55%,wrap,border-left \
             --bind="ctrl-/:toggle-preview" \
-            --bind="ctrl-x:execute($self wt-delete $r $s {})+$refresh"
+            --bind="ctrl-x:execute($self wt-delete $r $s {})+$refresh" \
+            --bind="ctrl-b:execute($self set-base $r $s)+$refresh"
     )
     rc=$?
     (( rc == 130 )) && { rm -rf "$state"; return 1 }
@@ -606,7 +639,7 @@ worktree_menu() {
       wt)     open_worktree "$repo" "${f[4]}"; break ;;
       local)  add_worktree "$repo" "${f[4]}" local || continue ;;
       remote) add_worktree "$repo" "${f[4]}" remote || continue ;;
-      create) create_branch "$repo" "${f[4]}" || continue ;;
+      create) create_branch "$repo" "${f[4]}" "$state" || continue ;;
       *)      continue ;;
     esac
     dir=$REPLY
@@ -622,19 +655,25 @@ case $1 in
   rows)      print_rows "$2" "$3" "$4"; exit 0 ;;
   header)    print_header "$2" "$3"; exit 0 ;;
   fetch)     fetch_in_background "$2" "$3"; exit 0 ;;
+  base-rows) base_rows "$2"; exit 0 ;;
+  base-fetch) base_fetch "$2"; exit 0 ;;
+  set-base)  pick_base "$2" $'Base for new branches (esc: cancel)' && print -r -- "$REPLY" > "$3/base"; exit 0 ;;
   wt-delete) delete_worktree "$2" "$3" "$4"; exit 0 ;;
   preview)   preview_row "$2" "$3" "$4"; exit 0 ;;
   preview-project) preview_project "$2"; exit 0 ;;
 esac
 
+# Roots come from the settings panel (an exported PROJECTS_DIR still wins).
+settings_load
+PROJECTS_DIR="${PROJECTS_DIR:-${S[projects-dir]}}"
+
 # Prints the fzf rows: display \t path, most recently opened first.
 build_list() {
   candidates=("${(f)"$(
     {
-      find "$PROJECTS_DIR" -maxdepth 2 -type d -name Repos
-      find "$PROJECTS_DIR" -maxdepth 3 -type d -path '*/Repos/*' ! -name '.*'
-      print -r -- "$HOME/dotfiles"
-      print -r -- "$HOME/Downloads"
+      find "$PROJECTS_DIR" -maxdepth 2 -type d -name "${S[repos-name]}"
+      find "$PROJECTS_DIR" -maxdepth 3 -type d -path "*/${S[repos-name]}/*" ! -name '.*'
+      print -rl -- ${(s/:/)S[extra-dirs]}
     } | sort -u
   )"}")
 

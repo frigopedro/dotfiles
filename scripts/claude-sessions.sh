@@ -39,6 +39,7 @@
 setopt extended_glob
 SELF=${0:A}
 source "${0:A:h}/lib/tmux-common.zsh"
+source "${0:A:h}/lib/tmux-settings.zsh"
 zmodload -F zsh/stat b:zstat
 
 REGISTRY_DIR="$HOME/.claude/sessions"
@@ -518,8 +519,10 @@ preview_repo() {
 # option changes.
 FLAG_waiting='#[bg=red,fg=white,bold] ⚠ #[default]'
 FLAG_review='#[bg=blue,fg=white,bold] ✓ #[default]'
-FLAG_working='#[fg=#0d1117]●#[default]'
 publish_tmux() {
+  settings_load
+  [[ ${S[claude-status]} == on ]] || return 0   # turned off in the settings panel
+  local FLAG_working="#[fg=${S[bar-fg]}]●#[default]"
   local pid st w line flag
   local -a f cmd
   local -A win_of cur_flag want
@@ -543,7 +546,7 @@ publish_tmux() {
   local summary=""
   (( nw )) && summary+="#[bg=red,fg=white,bold] ⚠ $nw waiting #[default] "
   (( nr )) && summary+="#[bg=blue,fg=white,bold] ✓ $nr review #[default] "
-  (( nk )) && summary+="#[fg=#0d1117]● $nk working#[default] "
+  (( nk )) && summary+="#[fg=${S[bar-fg]}]● $nk working#[default] "
   cmd=(set -g @claude_status "$summary")
 
   for w in ${(k)cur_flag}; do
