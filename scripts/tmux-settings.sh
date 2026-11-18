@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# Settings panel for the tmux tooling (prefix + S). Lists every setting from
+# Settings panel for the tmux tooling (prefix + .). Lists every setting from
 # lib/tmux-settings.zsh with its current value; enter edits it, ctrl-r resets it
 # to the default, ctrl-/ toggles the description. Changes are written to
 # tmux-settings.conf and applied at once (the theme is re-applied to the
